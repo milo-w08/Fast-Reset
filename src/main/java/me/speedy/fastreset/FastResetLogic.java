@@ -1,29 +1,55 @@
 package me.speedy.fastreset;
 
+import me.speedy.fastreset.access.FastResetManagedServer;
+import me.speedy.fastreset.access.FastResetMinecraftAccess;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.LevelLoadingScreen;
 import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.client.gui.screens.worldselection.CreateWorldScreen;
+import net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl;
+import net.minecraft.client.multiplayer.LevelLoadTracker;
+import net.minecraft.client.multiplayer.chat.report.ReportEnvironment;
+import net.minecraft.client.server.IntegratedServer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.Connection;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.login.ServerboundHelloPacket;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.WorldStem;
+import net.minecraft.server.level.ChunkLevel;
+import net.minecraft.server.level.progress.LoggingLevelLoadListener;
+import net.minecraft.server.packs.repository.PackRepository;
 import net.minecraft.world.level.biome.Biomes;
+import net.minecraft.world.level.gamerules.GameRules;
+import net.minecraft.world.level.storage.LevelStorageSource;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.net.SocketAddress;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.Properties;
+import java.util.List;
+import java.util.Optional;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class FastResetLogic {
+
+    public record WallSlot(int index, String title, String status, boolean active) {
+        public String label() {
+            return "#" + index + " " + title + "\n" + status;
+        }
+    }
 
     private enum PendingResult {
         NONE,
@@ -33,12 +59,10 @@ public class FastResetLogic {
 
     private static final String RESULT_PREFIX = "Desert Seed #";
     private static final Pattern RESULT_WORLD_NAME = Pattern.compile("^" + Pattern.quote(RESULT_PREFIX) + "(\\d+)$");
-    private static final String CONFIG_FILE_NAME = "fastreset.properties";
-    private static final String DESERT_LIMIT_KEY = "desertLimit";
-    private static final int DEFAULT_DESERT_LIMIT = 25;
 
     private static final Set<String> claimedWorlds = ConcurrentHashMap.newKeySet();
     private static final Set<String> rejectedWorlds = ConcurrentHashMap.newKeySet();
+    private static final Queue<FastResetQueueEntry> queuedWorlds = new ConcurrentLinkedQueue<>();
 
     public static volatile boolean active = false;
     public static volatile boolean worldLoaded = false;
@@ -48,36 +72,34 @@ public class FastResetLogic {
     private static volatile boolean stopRequested = false;
     private static volatile PendingResult pendingResult = PendingResult.NONE;
     private static volatile String pendingResultWorldName;
+    private static volatile FastResetQueueEntry currentEntry;
+    private static volatile String creatingWorldName;
+    private static volatile String finishReason;
     private static int desertsFoundThisRun = 0;
-    private static int desertLimit = DEFAULT_DESERT_LIMIT;
 
     public static void tick(Minecraft client) {
         if (!active) return;
 
-        if (client.level != null && client.player != null && !worldLoaded && currentWorldName != null) {
-            worldLoaded = true;
+        cleanupStoppedQueuedWorlds(client);
 
-            BlockPos pos = client.player.blockPosition();
-            boolean isDesert = client.level.getBiome(pos).is(Biomes.DESERT);
-
-            if (isDesert) {
-                desertsFoundThisRun++;
-                pendingResult = PendingResult.KEEP_DESERT;
-                pendingResultWorldName = currentWorldName;
-                claimedWorlds.remove(currentWorldName);
-                System.out.println("[FastReset] Desert found -> KEEP: " + currentWorldName);
-            } else {
-                pendingResult = PendingResult.DELETE_REJECTED;
-                pendingResultWorldName = currentWorldName;
-                rejectedWorlds.add(currentWorldName);
-                System.out.println("[FastReset] Not desert -> DELETE: " + currentWorldName);
-            }
-
-            client.execute(() -> client.disconnectFromWorld(Component.literal("[FastReset]")));
+        if (client.level != null && client.player != null && !worldLoaded && currentEntry != null) {
+            evaluateCurrentWorld(client);
         }
 
         if (worldLoaded && client.getSingleplayerServer() == null && pendingResult != PendingResult.NONE) {
             finishCurrentCandidate(client);
+        }
+
+        if (currentEntry == null && pendingResult == PendingResult.NONE) {
+            if (finishReason != null) {
+                if (queuedWorlds.isEmpty() && !autoCreateWorldRequested && creatingWorldName == null) {
+                    finishSearch(finishReason);
+                }
+                return;
+            }
+
+            fillQueue(client);
+            loadReadyQueuedWorld(client);
         }
     }
 
@@ -87,6 +109,60 @@ public class FastResetLogic {
 
     public static Component getSearchButtonLabel() {
         return Component.literal(active ? "Stop Search" : "Seed Search");
+    }
+
+    public static Component getWallSummary() {
+        String limit = FastResetConfig.desertLimit() == 0
+                ? "Unlimited"
+                : String.valueOf(FastResetConfig.desertLimit());
+
+        if (!active) {
+            return Component.literal("Seed Search ready - Parallel worlds: " + FastResetConfig.parallelWorlds());
+        }
+        if (finishReason != null) {
+            return Component.literal("Stopping - " + finishReason + " - Kept: " + desertsFoundThisRun + "/" + limit);
+        }
+        if (stopRequested) {
+            return Component.literal("Stopping - cleaning queued worlds - Kept: " + desertsFoundThisRun + "/" + limit);
+        }
+
+        return Component.literal("Queue: " + queuedWorlds.size() + " ready / " + FastResetConfig.parallelWorlds()
+                + " - Kept: " + desertsFoundThisRun + "/" + limit);
+    }
+
+    public static List<WallSlot> getWallSlots() {
+        int slotCount = FastResetConfig.parallelWorlds();
+        List<WallSlot> slots = new ArrayList<>(slotCount);
+
+        if (currentEntry != null) {
+            slots.add(new WallSlot(slots.size() + 1, currentEntry.worldName(), "Checking", true));
+        }
+
+        for (FastResetQueueEntry entry : new ArrayList<>(queuedWorlds)) {
+            if (slots.size() >= slotCount) break;
+
+            String status;
+            if (entry.isStopping()) {
+                status = "Cleaning";
+            } else if (entry.isReady()) {
+                status = "Ready";
+            } else {
+                status = "Loading";
+            }
+
+            slots.add(new WallSlot(slots.size() + 1, entry.worldName(), status, true));
+        }
+
+        if (slots.size() < slotCount && (creatingWorldName != null || autoCreateWorldRequested)) {
+            String title = creatingWorldName == null ? "New world" : creatingWorldName;
+            slots.add(new WallSlot(slots.size() + 1, title, "Building", true));
+        }
+
+        while (slots.size() < slotCount) {
+            slots.add(new WallSlot(slots.size() + 1, "Empty", active ? "Waiting" : "Idle", false));
+        }
+
+        return slots;
     }
 
     public static void toggleFromTitleScreen(Minecraft client) {
@@ -119,47 +195,90 @@ public class FastResetLogic {
         if (!autoCreateWorldRequested) return false;
 
         autoCreateWorldRequested = false;
-        return active && !stopRequested;
+        return active && !stopRequested && finishReason == null;
     }
 
     public static String prepareCandidateWorld(Minecraft client) {
-        if (!active || stopRequested) return null;
+        if (!active || stopRequested || finishReason != null) return null;
 
         String name = RESULT_PREFIX + getFirstAvailableResultNumber(client);
+        creatingWorldName = name;
         currentWorldName = name;
-        worldLoaded = false;
-        pendingResult = PendingResult.NONE;
-        pendingResultWorldName = null;
         claimedWorlds.add(name);
 
-        System.out.println("[FastReset] Trying to create: " + name);
+        System.out.println("[FastReset] Queueing candidate: " + name);
         return name;
     }
 
-    public static void prepareServerForRejectedCandidateShutdown(MinecraftServer server) {
-        if (pendingResult != PendingResult.DELETE_REJECTED || pendingResultWorldName == null) return;
-        if (!rejectedWorlds.contains(pendingResultWorldName)) return;
+    public static boolean captureQueuedWorldLoad(Minecraft client, LevelStorageSource.LevelStorageAccess levelAccess,
+                                                 PackRepository packRepository, WorldStem worldStem,
+                                                 Optional<GameRules> gameRules) {
+        String name = creatingWorldName;
+        if (!active || name == null) return false;
 
-        System.out.println("[FastReset] Skipping chunk save for rejected candidate: " + pendingResultWorldName);
+        creatingWorldName = null;
+
+        try {
+            levelAccess.saveDataTag(worldStem.worldDataAndGenSettings().data());
+
+            IntegratedServer server = MinecraftServer.spin(thread -> new IntegratedServer(
+                    thread,
+                    client,
+                    levelAccess,
+                    packRepository,
+                    worldStem,
+                    gameRules,
+                    client.services(),
+                    LoggingLevelLoadListener.forSingleplayer()
+            ));
+
+            FastResetQueueEntry entry = new FastResetQueueEntry(name, server);
+            queuedWorlds.add(entry);
+            currentWorldName = null;
+
+            System.out.println("[FastReset] Background world started: " + name);
+            client.setScreen(new TitleScreen());
+            return true;
+        } catch (Throwable throwable) {
+            throwable.printStackTrace();
+            finishReason = "failed to start queued world " + name;
+            rejectedWorlds.add(name);
+            levelAccess.safeClose();
+            deleteClaimedWorld(client, name);
+            rejectedWorlds.remove(name);
+            return true;
+        }
+    }
+
+    public static void prepareServerForRejectedCandidateShutdown(MinecraftServer server) {
+        String name = ((FastResetManagedServer) server).fastreset$getWorldName();
+        if (name == null || !rejectedWorlds.contains(name)) return;
+
+        System.out.println("[FastReset] Skipping chunk save for rejected candidate: " + name);
         server.setAutoSave(false);
     }
 
     private static void startSearch(Minecraft client) {
-        loadConfig(client);
+        FastResetConfig.load(client);
 
         active = true;
         stopRequested = false;
         autoCreateWorldRequested = false;
         worldLoaded = false;
         currentWorldName = null;
+        creatingWorldName = null;
         pendingResult = PendingResult.NONE;
         pendingResultWorldName = null;
+        currentEntry = null;
+        finishReason = null;
         desertsFoundThisRun = 0;
         claimedWorlds.clear();
         rejectedWorlds.clear();
+        queuedWorlds.clear();
 
-        System.out.println("[FastReset] Seed search started. desertLimit=" + desertLimit);
-        openCreateWorldScreen(client);
+        System.out.println("[FastReset] Seed search started. desertLimit=" + FastResetConfig.desertLimit()
+                + ", parallelWorlds=" + FastResetConfig.parallelWorlds());
+        fillQueue(client);
     }
 
     private static void requestStop() {
@@ -167,11 +286,10 @@ public class FastResetLogic {
 
         stopRequested = true;
         autoCreateWorldRequested = false;
-        System.out.println("[FastReset] Stop requested. Cleaning current candidate first.");
+        finishReason = "manual stop";
+        System.out.println("[FastReset] Stop requested. Cleaning queued candidates.");
 
-        if (!worldLoaded && currentWorldName == null && pendingResult == PendingResult.NONE) {
-            finishSearch("manual stop");
-        }
+        cleanupQueuedCandidates();
     }
 
     private static void finishSearch(String reason) {
@@ -180,12 +298,39 @@ public class FastResetLogic {
         autoCreateWorldRequested = false;
         worldLoaded = false;
         currentWorldName = null;
+        creatingWorldName = null;
         pendingResult = PendingResult.NONE;
         pendingResultWorldName = null;
+        currentEntry = null;
+        finishReason = null;
         claimedWorlds.clear();
         rejectedWorlds.clear();
+        queuedWorlds.clear();
 
         System.out.println("[FastReset] Seed search stopped: " + reason + ". Desert worlds kept this run: " + desertsFoundThisRun);
+    }
+
+    private static void evaluateCurrentWorld(Minecraft client) {
+        worldLoaded = true;
+        currentWorldName = currentEntry.worldName();
+
+        BlockPos pos = client.player.blockPosition();
+        boolean isDesert = client.level.getBiome(pos).is(Biomes.DESERT);
+
+        if (isDesert) {
+            desertsFoundThisRun++;
+            pendingResult = PendingResult.KEEP_DESERT;
+            pendingResultWorldName = currentEntry.worldName();
+            claimedWorlds.remove(currentEntry.worldName());
+            System.out.println("[FastReset] Desert found -> KEEP: " + currentEntry.worldName());
+        } else {
+            pendingResult = PendingResult.DELETE_REJECTED;
+            pendingResultWorldName = currentEntry.worldName();
+            rejectedWorlds.add(currentEntry.worldName());
+            System.out.println("[FastReset] Not desert -> DELETE: " + currentEntry.worldName());
+        }
+
+        client.execute(() -> client.disconnectFromWorld(Component.literal("[FastReset]")));
     }
 
     private static void finishCurrentCandidate(Minecraft client) {
@@ -196,45 +341,159 @@ public class FastResetLogic {
         pendingResultWorldName = null;
         currentWorldName = null;
         worldLoaded = false;
+        currentEntry = null;
 
         if (result == PendingResult.DELETE_REJECTED) {
             boolean deleted = deleteClaimedWorld(client, name);
             rejectedWorlds.remove(name);
 
             if (!deleted) {
-                finishSearch("failed to delete rejected candidate " + name);
+                finishReason = "failed to delete rejected candidate " + name;
+                cleanupQueuedCandidates();
                 return;
             }
         }
 
         if (shouldContinueSearch()) {
-            openCreateWorldScreen(client);
-        } else if (stopRequested) {
-            finishSearch("manual stop");
+            fillQueue(client);
+            loadReadyQueuedWorld(client);
         } else {
-            finishSearch("desert limit reached");
+            finishReason = stopRequested ? "manual stop" : "desert limit reached";
+            cleanupQueuedCandidates();
         }
     }
 
     private static boolean shouldContinueSearch() {
-        if (!active || stopRequested) return false;
-        return desertLimit == 0 || desertsFoundThisRun < desertLimit;
+        if (!active || stopRequested || finishReason != null) return false;
+        int limit = FastResetConfig.desertLimit();
+        return limit == 0 || desertsFoundThisRun < limit;
+    }
+
+    private static void fillQueue(Minecraft client) {
+        if (!shouldContinueSearch()) return;
+        if (autoCreateWorldRequested || creatingWorldName != null) return;
+        if (client.level != null || client.getSingleplayerServer() != null) return;
+        if (client.screen instanceof CreateWorldScreen) return;
+        if (loadedWorldCount() >= FastResetConfig.parallelWorlds()) return;
+
+        openCreateWorldScreen(client);
+    }
+
+    private static int loadedWorldCount() {
+        int count = queuedWorlds.size();
+        if (currentEntry != null) count++;
+        if (autoCreateWorldRequested || creatingWorldName != null) count++;
+        return count;
+    }
+
+    private static void loadReadyQueuedWorld(Minecraft client) {
+        if (!shouldContinueSearch()) return;
+        if (currentEntry != null || client.level != null || client.getSingleplayerServer() != null) return;
+        if (autoCreateWorldRequested || creatingWorldName != null || client.screen instanceof CreateWorldScreen) return;
+
+        for (FastResetQueueEntry entry : new ArrayList<>(queuedWorlds)) {
+            if (entry.isStopping() || !entry.isReady()) continue;
+            if (!queuedWorlds.remove(entry)) continue;
+
+            currentEntry = entry;
+            worldLoaded = false;
+            currentWorldName = entry.worldName();
+            entry.markLoadRequested();
+            connectToQueuedWorld(client, entry);
+            return;
+        }
+    }
+
+    private static void connectToQueuedWorld(Minecraft client, FastResetQueueEntry entry) {
+        try {
+            Instant start = Instant.now();
+            LevelLoadTracker tracker = new LevelLoadTracker(0L);
+            LevelLoadingScreen loadingScreen = new LevelLoadingScreen(tracker, LevelLoadingScreen.Reason.OTHER);
+            client.setScreen(loadingScreen);
+
+            FastResetMinecraftAccess access = (FastResetMinecraftAccess) client;
+            access.fastreset$setSingleplayerServer(entry.server());
+            access.fastreset$setLocalServer(true);
+            client.updateReportEnvironment(ReportEnvironment.local());
+
+            int radius = Math.max(5, 3) + ChunkLevel.RADIUS_AROUND_FULL_CHUNK + 1;
+            tracker.setServerChunkStatusView(entry.server().createChunkLoadStatusView(radius));
+
+            SocketAddress address = entry.server().getConnection().startMemoryChannel();
+            Connection connection = Connection.connectToLocalServer(address);
+            connection.initiateServerboundPlayConnection(
+                    address.toString(),
+                    0,
+                    new ClientHandshakePacketListenerImpl(
+                            connection,
+                            client,
+                            null,
+                            null,
+                            false,
+                            Duration.between(start, Instant.now()),
+                            component -> {},
+                            tracker,
+                            null
+                    )
+            );
+            connection.send(new ServerboundHelloPacket(client.getUser().getName(), client.getUser().getProfileId()));
+            access.fastreset$setPendingConnection(connection);
+
+            System.out.println("[FastReset] Loading queued world: " + entry.worldName());
+        } catch (Throwable throwable) {
+            throwable.printStackTrace();
+            rejectedWorlds.add(entry.worldName());
+            FastResetMinecraftAccess access = (FastResetMinecraftAccess) client;
+            access.fastreset$setSingleplayerServer(null);
+            access.fastreset$setLocalServer(false);
+            access.fastreset$setPendingConnection(null);
+            if (!queuedWorlds.contains(entry)) {
+                queuedWorlds.add(entry);
+            }
+            entry.stop(true);
+            currentEntry = null;
+            finishReason = "failed to load queued world " + entry.worldName();
+            cleanupQueuedCandidates();
+        }
+    }
+
+    private static void cleanupQueuedCandidates() {
+        for (FastResetQueueEntry entry : new ArrayList<>(queuedWorlds)) {
+            if (entry.isStopping()) continue;
+
+            rejectedWorlds.add(entry.worldName());
+            entry.stop(true);
+            System.out.println("[FastReset] Stopping queued candidate: " + entry.worldName());
+        }
+    }
+
+    private static void cleanupStoppedQueuedWorlds(Minecraft client) {
+        for (FastResetQueueEntry entry : new ArrayList<>(queuedWorlds)) {
+            if (!entry.isStopping() || !entry.isShutdown()) continue;
+
+            queuedWorlds.remove(entry);
+            if (entry.shouldDeleteAfterStop()) {
+                deleteClaimedWorld(client, entry.worldName());
+                rejectedWorlds.remove(entry.worldName());
+            }
+        }
     }
 
     private static int getFirstAvailableResultNumber(Minecraft client) {
         try {
             Path saves = getSavesPath(client);
-            if (!Files.exists(saves)) return 1;
-
             Set<Integer> usedNumbers = new HashSet<>();
 
-            try (var stream = Files.list(saves)) {
-                for (Path path : (Iterable<Path>) stream::iterator) {
-                    Matcher matcher = RESULT_WORLD_NAME.matcher(path.getFileName().toString());
-                    if (matcher.matches()) {
-                        usedNumbers.add(Integer.parseInt(matcher.group(1)));
+            if (Files.exists(saves)) {
+                try (var stream = Files.list(saves)) {
+                    for (Path path : (Iterable<Path>) stream::iterator) {
+                        addResultNumber(usedNumbers, path.getFileName().toString());
                     }
                 }
+            }
+
+            for (String claimedWorld : claimedWorlds) {
+                addResultNumber(usedNumbers, claimedWorld);
             }
 
             for (int number = 1; number < Integer.MAX_VALUE; number++) {
@@ -245,6 +504,13 @@ public class FastResetLogic {
         }
 
         return 1;
+    }
+
+    private static void addResultNumber(Set<Integer> usedNumbers, String worldName) {
+        Matcher matcher = RESULT_WORLD_NAME.matcher(worldName);
+        if (matcher.matches()) {
+            usedNumbers.add(Integer.parseInt(matcher.group(1)));
+        }
     }
 
     private static boolean deleteClaimedWorld(Minecraft client, String name) {
@@ -293,59 +559,12 @@ public class FastResetLogic {
         }
     }
 
-    private static void loadConfig(Minecraft client) {
-        Path config = getConfigPath(client);
-        ensureDefaultConfig(config);
-
-        Properties properties = new Properties();
-        try (InputStream input = Files.newInputStream(config)) {
-            properties.load(input);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-
-        desertLimit = parseDesertLimit(properties.getProperty(DESERT_LIMIT_KEY));
-    }
-
-    private static void ensureDefaultConfig(Path config) {
-        if (Files.exists(config)) return;
-
-        try {
-            Files.createDirectories(config.getParent());
-
-            Properties properties = new Properties();
-            properties.setProperty(DESERT_LIMIT_KEY, String.valueOf(DEFAULT_DESERT_LIMIT));
-
-            try (OutputStream output = Files.newOutputStream(config)) {
-                properties.store(output, "FastReset seed search settings. Set desertLimit=0 for unlimited.");
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    private static int parseDesertLimit(String rawLimit) {
-        if (rawLimit == null) return DEFAULT_DESERT_LIMIT;
-
-        try {
-            int parsed = Integer.parseInt(rawLimit.trim());
-            return Math.max(0, parsed);
-        } catch (NumberFormatException e) {
-            System.out.println("[FastReset] Invalid desertLimit '" + rawLimit + "', using " + DEFAULT_DESERT_LIMIT);
-            return DEFAULT_DESERT_LIMIT;
-        }
-    }
-
     private static Path getSavesPath(Minecraft client) {
         return client.gameDirectory.toPath().resolve("saves");
     }
 
-    private static Path getConfigPath(Minecraft client) {
-        return client.gameDirectory.toPath().resolve("config").resolve(CONFIG_FILE_NAME);
-    }
-
     private static void openCreateWorldScreen(Minecraft client) {
-        if (!active || stopRequested) return;
+        if (!active || stopRequested || finishReason != null) return;
 
         autoCreateWorldRequested = true;
         client.execute(() -> CreateWorldScreen.openFresh(client, () -> {}));
